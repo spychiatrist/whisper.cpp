@@ -509,6 +509,10 @@ cmake --build build -j --config Release
 
 https://user-images.githubusercontent.com/1991296/194935793-76afede7-cfa8-48d8-a80f-28ba83be7d09.mp4
 
+## whisper-paste (macOS)
+
+[whisper-paste](tools/whisper-paste/README.md) is a macOS voice-to-text tool built on top of whisper.cpp. press a global hotkey, speak, and the transcription pastes straight into whatever field is focused — browser, messages, terminal, anywhere. runs fully offline on Apple Silicon via Metal.
+
 ## Confidence color-coding
 
 Adding the `--print-colors` argument will print the transcribed text using an experimental color coding strategy

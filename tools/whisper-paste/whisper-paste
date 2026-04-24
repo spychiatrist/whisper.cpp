@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Usage: whisper-paste
+# Records via mic with auto silence-detection, transcribes, copies to clipboard, pastes.
+# Assign to a global hotkey via macOS Shortcuts or Automator for system-wide use.
+
+set -eo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if [[ -z "${WHISPER_DIR:-}" ]]; then
+    osascript -e 'display alert "whisper-paste: WHISPER_DIR not set" message "Export WHISPER_DIR=/path/to/whisper.cpp in your shell config." as critical' 2>/dev/null || true
+    exit 1
+fi
+
+WHISPER_CLI="${WHISPER_CLI:-$WHISPER_DIR/build/bin/whisper-cli}"
+MODEL="${WHISPER_MODEL:-$WHISPER_DIR/models/ggml-large-v3-turbo.bin}"
+TMP=$(mktemp -t whisper)
+TMP_WAV="${TMP}.wav"
+trap 'rm -f "$TMP" "$TMP_WAV"' EXIT
+
+# Capture frontmost app to restore focus after recording
+PREV_APP=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || true)
+
+afplay /System/Library/Sounds/Tink.aiff &
+sleep 0.5
+rec -r 16000 -c 1 -b 16 -e signed-integer "$TMP_WAV" 2>/dev/null &
+REC_PID=$!
+
+RESULT=$(osascript -e 'display dialog "🎙  Recording — speak when ready, pause as long as you like." buttons {"Cancel", "Normal", "casual"} default button "Normal" cancel button "Cancel" with title "Whisper Dictate" giving up after 300' 2>/dev/null || echo "button returned:Cancel")
+STYLE=$(echo "$RESULT" | sed 's/.*button returned:\([^,]*\).*/\1/')
+
+if [[ "$STYLE" == "Cancel" ]] || echo "$RESULT" | grep -q "gave up:true"; then
+    kill "$REC_PID" 2>/dev/null
+    wait "$REC_PID" 2>/dev/null || true
+    exit 0
+fi
+
+kill "$REC_PID" 2>/dev/null
+wait "$REC_PID" 2>/dev/null || true
+
+PROMPT_ARG=()
+if [[ "$STYLE" == "casual" ]]; then
+    PROMPT_ARG=(--prompt "$(cat "${WHISPER_STYLE_DIR:-$HOME/.config/whisper-dictate/styles}/casual.txt")")
+fi
+
+TEXT=$("$WHISPER_CLI" -m "$MODEL" -f "$TMP_WAV" -np -nt -l en ${PROMPT_ARG[@]+"${PROMPT_ARG[@]}"} 2>/dev/null \
+    | sed 's/^[[:space:]]*//' \
+    | tr -d '\n' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+[[ -z "$TEXT" ]] && exit 0
+
+echo -n "$TEXT" | pbcopy
+
+# Restore previous app and paste
+if [[ -n "$PREV_APP" ]]; then
+    osascript -e "tell application \"$PREV_APP\" to activate" 2>/dev/null || true
+    sleep 0.15
+fi
+
+osascript -e 'tell application "System Events" to keystroke "v" using {command down}' 2>/dev/null || true
+afplay /System/Library/Sounds/Pop.aiff
