@@ -25,10 +25,13 @@ sleep 0.5
 rec -r 16000 -c 1 -b 16 -e signed-integer "$TMP_WAV" 2>/dev/null &
 REC_PID=$!
 
-RESULT=$(osascript -e 'display dialog "🎙  Recording — speak when ready, pause as long as you like." buttons {"Cancel", "Normal", "casual"} default button "Normal" cancel button "Cancel" with title "Whisper Dictate" giving up after 300' 2>/dev/null || echo "button returned:Cancel")
+RESULT=$(osascript -e 'display dialog "🎙  Recording — speak when ready, pause as long as you like." buttons {"Cancel", "Normal", "casual"} default button "Normal" cancel button "Cancel" with title "Whisper Dictate" giving up after 1800' 2>/dev/null || echo "button returned:Cancel")
 STYLE=$(echo "$RESULT" | sed 's/.*button returned:\([^,]*\).*/\1/')
 
-if [[ "$STYLE" == "Cancel" ]] || echo "$RESULT" | grep -q "gave up:true"; then
+GAVE_UP=false
+if echo "$RESULT" | grep -q "gave up:true"; then GAVE_UP=true; fi
+
+if [[ "$STYLE" == "Cancel" ]]; then
     kill "$REC_PID" 2>/dev/null
     wait "$REC_PID" 2>/dev/null || true
     exit 0
@@ -36,6 +39,11 @@ fi
 
 kill "$REC_PID" 2>/dev/null
 wait "$REC_PID" 2>/dev/null || true
+
+if $GAVE_UP; then
+    afplay /System/Library/Sounds/Basso.aiff &
+    STYLE="Normal"
+fi
 
 PROMPT_ARG=()
 if [[ "$STYLE" == "casual" ]]; then
