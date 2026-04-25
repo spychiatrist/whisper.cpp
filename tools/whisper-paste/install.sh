@@ -61,6 +61,9 @@ green "Model ready"
 
 # ── Install whisper-paste ─────────────────────────────────────────────────────
 
+step "Testing whisper-paste"
+bash "$SCRIPT_DIR/test-whisper-paste"
+
 step "Installing whisper-paste"
 mkdir -p "$HOME/.local/bin"
 cp "$SCRIPT_DIR/whisper-paste" "$HOME/.local/bin/whisper-paste"

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run tests, then install whisper-paste to ~/.local/bin if they pass.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+bash test-whisper-paste
+cp whisper-paste ~/.local/bin/whisper-paste
+printf '\033[32mDeployed\033[0m → ~/.local/bin/whisper-paste\n'

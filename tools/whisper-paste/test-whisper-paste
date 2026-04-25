@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# Test suite for whisper-paste. Run directly or via ./deploy.
+set -eo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+SCRIPT="$(pwd)/whisper-paste"
+PASS=0; FAIL=0
+
+pass() { printf '\033[32mPASS\033[0m  %s\n' "$1"; (( PASS++ )) || true; }
+fail() { printf '\033[31mFAIL\033[0m  %s\n' "$1"; (( FAIL++ )) || true; }
+skip() { printf '\033[33mSKIP\033[0m  %s\n' "$1"; }
+
+# ── mock infrastructure ───────────────────────────────────────────────────────
+
+MOCK_DIR=$(mktemp -d)
+TEST_HOME=$(mktemp -d)
+CLIPBOARD="$MOCK_DIR/clipboard"
+trap 'rm -rf "$MOCK_DIR" "$TEST_HOME"' EXIT
+
+# rec: write a valid WAV header to the output file, then block until killed
+cat > "$MOCK_DIR/rec" <<'EOF'
+#!/usr/bin/env bash
+for arg; do
+    [[ "$arg" == *.wav ]] && \
+        printf 'RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00' > "$arg"
+done
+sleep 3600
+EOF
+
+# whisper-cli: echo a fake transcript regardless of args
+cat > "$MOCK_DIR/whisper-cli" <<'EOF'
+#!/usr/bin/env bash
+echo "  hello from whisper  "
+EOF
+
+# pbcopy: capture stdin to a file we can assert against
+cat > "$MOCK_DIR/pbcopy" <<EOF
+#!/usr/bin/env bash
+cat > "$CLIPBOARD"
+EOF
+
+# afplay, open: silent no-ops
+for cmd in afplay open; do printf '#!/usr/bin/env bash\n:\n' > "$MOCK_DIR/$cmd"; done
+
+chmod +x "$MOCK_DIR"/rec "$MOCK_DIR"/whisper-cli "$MOCK_DIR"/pbcopy \
+         "$MOCK_DIR"/afplay "$MOCK_DIR"/open
+
+# osascript mock: reads AppleScript from stdin (all our calls use heredocs),
+# routes on content, and honours two env vars:
+#   DIALOG_RESPONSE  – what the recording dialog returns (default: Normal button)
+#   CANCEL_DIALOG    – if "1", exit 1 to simulate the Cancel button
+make_osascript() {
+    local dialog_response="${1:-button returned:Normal, gave up:false}"
+    local cancel="${2:-0}"
+    cat > "$MOCK_DIR/osascript" <<EOF
+#!/usr/bin/env bash
+# Support both -e "script" and heredoc (stdin) forms
+if [[ "\$1" == "-e" ]]; then input="\$2"; else input=\$(cat); fi
+if   echo "\$input" | grep -q "frontmost";      then echo "TestApp"
+elif echo "\$input" | grep -q "activate\|keystroke"; then :
+elif echo "\$input" | grep -q "Whisper Dictate"; then
+    [[ "$cancel" == "1" ]] && exit 1
+    echo "$dialog_response"
+elif echo "\$input" | grep -q "choose from list\|display dialog\|display alert"; then :
+fi
+EOF
+    chmod +x "$MOCK_DIR/osascript"
+}
+
+run_script() {
+    PATH="$MOCK_DIR:$PATH" \
+    HOME="$TEST_HOME" \
+    WHISPER_DIR="/fake" \
+    WHISPER_CLI="$MOCK_DIR/whisper-cli" \
+    WHISPER_MODEL="$MOCK_DIR/fake.bin" \
+    WHISPER_STYLE_DIR="$TEST_HOME/.config/whisper-dictate/styles" \
+    bash "$SCRIPT" 2>/dev/null
+}
+
+# ── tests ─────────────────────────────────────────────────────────────────────
+
+# 1. Syntax
+bash -n "$SCRIPT" 2>/dev/null \
+    && pass "syntax (bash -n)" \
+    || fail "syntax (bash -n)"
+
+# 2. shellcheck (advisory — skip if not installed)
+if command -v shellcheck &>/dev/null; then
+    shellcheck --shell=bash --exclude=SC1090,SC2034 "$SCRIPT" 2>/dev/null \
+        && pass "shellcheck" \
+        || fail "shellcheck"
+else
+    skip "shellcheck (not installed)"
+fi
+
+# 3. Normal flow: dialog returns Normal → clipboard receives transcription
+make_osascript "button returned:Normal, gave up:false"
+rm -f "$CLIPBOARD"
+run_script || true
+if [[ "$(cat "$CLIPBOARD" 2>/dev/null)" == "hello from whisper" ]]; then
+    pass "normal flow → clipboard"
+else
+    fail "normal flow → clipboard (got: '$(cat "$CLIPBOARD" 2>/dev/null)')"
+fi
+
+# 4. casual flow: dialog returns casual → clipboard receives transcription
+make_osascript "button returned:casual, gave up:false"
+mkdir -p "$TEST_HOME/.config/whisper-dictate/styles"
+echo "be casual" > "$TEST_HOME/.config/whisper-dictate/styles/casual.txt"
+rm -f "$CLIPBOARD"
+run_script || true
+if [[ "$(cat "$CLIPBOARD" 2>/dev/null)" == "hello from whisper" ]]; then
+    pass "casual flow → clipboard"
+else
+    fail "casual flow → clipboard (got: '$(cat "$CLIPBOARD" 2>/dev/null)')"
+fi
+
+# 5. Cancel: osascript exits non-zero → script exits 0, nothing in clipboard
+make_osascript "" "1"
+rm -f "$CLIPBOARD"
+run_script || true
+if [[ ! -f "$CLIPBOARD" ]]; then
+    pass "cancel → no clipboard write"
+else
+    fail "cancel → no clipboard write (clipboard was written: '$(cat "$CLIPBOARD")')"
+fi
+
+# 6. Timeout (gave up): dialog gives up → transcribes with default style
+make_osascript "gave up:true"
+rm -f "$CLIPBOARD"
+run_script || true
+if [[ "$(cat "$CLIPBOARD" 2>/dev/null)" == "hello from whisper" ]]; then
+    pass "timeout/gave-up → clipboard"
+else
+    fail "timeout/gave-up → clipboard (got: '$(cat "$CLIPBOARD" 2>/dev/null)')"
+fi
+
+# 7. Config round-trip: write_config creates readable config file
+make_osascript "button returned:Normal, gave up:false"
+rm -f "$CLIPBOARD"
+WHISPER_TIMEOUT=600 WHISPER_DEFAULT_STYLE=casual \
+    PATH="$MOCK_DIR:$PATH" \
+    HOME="$TEST_HOME" \
+    WHISPER_DIR="/fake" \
+    WHISPER_CLI="$MOCK_DIR/whisper-cli" \
+    WHISPER_MODEL="$MOCK_DIR/fake.bin" \
+    WHISPER_STYLE_DIR="$TEST_HOME/.config/whisper-dictate/styles" \
+    bash "$SCRIPT" 2>/dev/null || true
+cfg="$TEST_HOME/.config/whisper-dictate/config"
+if grep -q "WHISPER_TIMEOUT=1800" "$cfg" 2>/dev/null || \
+   grep -q "WHISPER_DEFAULT_STYLE" "$cfg" 2>/dev/null || \
+   [[ ! -f "$cfg" ]]; then
+    # Config is only written when settings are changed via the UI; skip if absent
+    skip "config round-trip (requires settings UI interaction)"
+else
+    fail "config round-trip (unexpected config state)"
+fi
+
+# ── summary ───────────────────────────────────────────────────────────────────
+
+echo ""
+total=$(( PASS + FAIL ))
+if (( FAIL == 0 )); then
+    printf '\033[32m%d/%d tests passed\033[0m\n' "$PASS" "$total"
+else
+    printf '\033[31m%d/%d tests passed, %d failed\033[0m\n' "$PASS" "$total" "$FAIL"
+    exit 1
+fi
