@@ -5,6 +5,7 @@ WHISPER_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 SCRIPT_DIR="$WHISPER_DIR/tools/whisper-paste"
 MODEL_NAME="large-v3-turbo"
 HOTKEY="cmd + alt - space"
+SETTINGS_HOTKEY="cmd + alt - 0x2B"  # ⌥⌘, (comma) — macOS preferences convention
 
 red()   { printf "\033[1;31m%s\033[0m\n" "$*"; }
 green() { printf "\033[1;32m%s\033[0m\n" "$*"; }
@@ -103,15 +104,29 @@ fi
 
 # ── skhd ─────────────────────────────────────────────────────────────────────
 
-step "Configuring skhd hotkey ($HOTKEY)"
+step "Configuring skhd hotkeys ($HOTKEY record, ⌥⌘, settings)"
 SKHDRC="$HOME/.skhdrc"
-SKHD_LINE="$HOTKEY : WHISPER_DIR=\"$WHISPER_DIR\" $HOME/.local/bin/whisper-paste"
-if [[ ! -f "$SKHDRC" ]] || ! grep -qF "whisper-paste" "$SKHDRC"; then
-    echo "$SKHD_LINE" >> "$SKHDRC"
-    echo "Added hotkey to $SKHDRC"
+RECORD_LINE="$HOTKEY : WHISPER_DIR=\"$WHISPER_DIR\" $HOME/.local/bin/whisper-paste"
+SETTINGS_LINE="$SETTINGS_HOTKEY : WHISPER_DIR=\"$WHISPER_DIR\" $HOME/.local/bin/whisper-paste --settings"
+
+touch "$SKHDRC"
+
+# Record hotkey: a line ending in whisper-paste (no --settings flag)
+if grep -qE 'whisper-paste[[:space:]]*$' "$SKHDRC"; then
+    echo "Record hotkey already in $SKHDRC"
 else
-    echo "whisper-paste hotkey already in $SKHDRC"
+    echo "$RECORD_LINE" >> "$SKHDRC"
+    echo "Added record hotkey to $SKHDRC"
 fi
+
+# Settings hotkey: line containing whisper-paste --settings
+if grep -qF -- "whisper-paste --settings" "$SKHDRC"; then
+    echo "Settings hotkey already in $SKHDRC"
+else
+    echo "$SETTINGS_LINE" >> "$SKHDRC"
+    echo "Added settings hotkey (⌥⌘,) to $SKHDRC"
+fi
+
 skhd --start-service 2>/dev/null || skhd --restart-service 2>/dev/null || true
 green "skhd configured and running"
 
@@ -134,8 +149,10 @@ echo "     → add /opt/homebrew/Cellar/skhd/$(skhd --version 2>/dev/null | awk 
 echo "     (use the real binary path, not the symlink)"
 echo ""
 echo "Usage:"
-echo "  Hotkey: $(echo "$HOTKEY" | sed 's/cmd/⌘/;s/alt/⌥/;s/ - / + /;s/space/Space/')"
-echo "  Or from terminal: whisper-paste"
+echo "  Record:   ⌥⌘Space   (or: whisper-paste)"
+echo "  Settings: ⌥⌘,       (or: whisper-paste --settings)"
+echo ""
+echo "Settings menu lets you change timeout, default style, and the casual prompt."
 echo ""
 echo "Customise your casual writing style:"
 echo "  \$EDITOR ~/.config/whisper-dictate/styles/casual.txt"

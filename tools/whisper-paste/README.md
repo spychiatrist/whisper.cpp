@@ -32,19 +32,33 @@ skhd --restart-service
 
 ## usage
 
-**hotkey:** `⌥⌘Space` — works anywhere, including terminals, iMessage, Slack, browsers
+**record hotkey:** `⌥⌘Space` — works anywhere, including terminals, iMessage, Slack, browsers
+**settings hotkey:** `⌥⌘,` — opens the settings menu (macOS preference convention)
 
 1. press `⌥⌘Space`; you'll hear a Tink sound confirming it started
-2. speak — pause as long as you like, it won't cut you off
+2. speak — pause as long as you like, it won't cut you off (default 30 min timeout)
 3. click **Normal** or **casual** to stop and transcribe; **Cancel** (or Escape) to abort
 
 the transcribed text is copied to your clipboard and pasted into whatever field was focused when you triggered the hotkey.
 
+if the recording times out, you'll hear a Basso sound and the audio is transcribed anyway (no work lost).
+
 you can also run it directly from a terminal:
 
 ```bash
-whisper-paste
+whisper-paste              # record
+whisper-paste --settings   # open settings menu
 ```
+
+## settings
+
+press `⌥⌘,` (or run `whisper-paste --settings`) to open a menu with:
+
+- **Change Timeout** — how long the recording dialog waits before auto-transcribing (default 30 min)
+- **Change Default Style** — Normal or casual (controls which button is selected when you press Return)
+- **Edit Casual Prompt** — opens `casual.txt` in your default text editor
+
+settings are stored in `~/.config/whisper-dictate/config` as `KEY=VALUE` pairs.
 
 ## style modes
 
@@ -56,12 +70,27 @@ note: casual mode can occasionally hallucinate on silence or very short recordin
 
 ## configuration
 
+settings live in `~/.config/whisper-dictate/config` (managed via the settings menu). environment variables override at runtime:
+
 | env var | default | description |
 |---|---|---|
 | `WHISPER_DIR` | set by install script | path to the whisper.cpp repo root |
 | `WHISPER_CLI` | `$WHISPER_DIR/build/bin/whisper-cli` | override the binary |
 | `WHISPER_MODEL` | `$WHISPER_DIR/models/ggml-large-v3-turbo.bin` | use a different model |
 | `WHISPER_STYLE_DIR` | `~/.config/whisper-dictate/styles` | directory containing style prompt files |
+| `WHISPER_TIMEOUT` | `1800` (30 min) | recording dialog timeout in seconds |
+| `WHISPER_DEFAULT_STYLE` | `Normal` | default button (`Normal` or `casual`) |
+
+## development
+
+if you're hacking on the script:
+
+```bash
+./tools/whisper-paste/test-whisper-paste   # run the test suite (mocks all deps)
+./tools/whisper-paste/deploy               # test, then copy to ~/.local/bin
+```
+
+the test suite mocks `osascript`, `rec`, `whisper-cli`, `pbcopy`, etc. so it runs anywhere without a mic or whisper install. five tests cover the main flows (normal, casual, cancel, timeout, syntax).
 
 ## model
 
