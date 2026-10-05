@@ -24,7 +24,7 @@ for arg; do
     [[ "$arg" == *.wav ]] && \
         printf 'RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00' > "$arg"
 done
-sleep 3600
+exec sleep 3600
 EOF
 
 # whisper-cli: echo a fake transcript regardless of args
@@ -42,8 +42,18 @@ EOF
 # afplay, open: silent no-ops
 for cmd in afplay open; do printf '#!/usr/bin/env bash\n:\n' > "$MOCK_DIR/$cmd"; done
 
+# sox: "sox in out pad X" -> copy in to out, log args for assertions
+cat > "$MOCK_DIR/sox" <<EOF
+#!/usr/bin/env bash
+cp "\$1" "\$2"
+echo "\$@" >> "$MOCK_DIR/sox.log"
+EOF
+
+# soxi -D: fixed duration
+printf '#!/usr/bin/env bash\necho 1.5\n' > "$MOCK_DIR/soxi"
+
 chmod +x "$MOCK_DIR"/rec "$MOCK_DIR"/whisper-cli "$MOCK_DIR"/pbcopy \
-         "$MOCK_DIR"/afplay "$MOCK_DIR"/open
+         "$MOCK_DIR"/afplay "$MOCK_DIR"/open "$MOCK_DIR"/sox "$MOCK_DIR"/soxi
 
 # osascript mock: reads AppleScript from stdin (all our calls use heredocs),
 # routes on content, and honours two env vars:
@@ -58,6 +68,7 @@ make_osascript() {
 if [[ "\$1" == "-e" ]]; then input="\$2"; else input=\$(cat); fi
 if   echo "\$input" | grep -q "frontmost";      then echo "TestApp"
 elif echo "\$input" | grep -q "activate\|keystroke"; then :
+elif echo "\$input" | grep -q "display notification"; then echo "\$input" >> "$MOCK_DIR/notify.log"
 elif echo "\$input" | grep -q "Whisper Dictate"; then
     [[ "$cancel" == "1" ]] && exit 1
     echo "$dialog_response"
@@ -67,14 +78,20 @@ EOF
     chmod +x "$MOCK_DIR/osascript"
 }
 
+LOG_ROOT="$TEST_HOME/recordings"
+
+latest_session() { ls -1d "$LOG_ROOT"/*/ 2>/dev/null | sort | tail -1; }
+
 run_script() {
+    WHISPER_LOG_DIR="$LOG_ROOT" \
+    WHISPER_VAD_MODEL="$MOCK_DIR/no-vad.bin" \
     PATH="$MOCK_DIR:$PATH" \
     HOME="$TEST_HOME" \
     WHISPER_DIR="/fake" \
     WHISPER_CLI="$MOCK_DIR/whisper-cli" \
     WHISPER_MODEL="$MOCK_DIR/fake.bin" \
     WHISPER_STYLE_DIR="$TEST_HOME/.config/whisper-dictate/styles" \
-    bash "$SCRIPT" 2>/dev/null
+    bash "$SCRIPT" "$@" 2>/dev/null
 }
 
 # ── tests ─────────────────────────────────────────────────────────────────────
@@ -154,6 +171,74 @@ if grep -q "WHISPER_TIMEOUT=1800" "$cfg" 2>/dev/null || \
     skip "config round-trip (requires settings UI interaction)"
 else
     fail "config round-trip (unexpected config state)"
+fi
+
+# 8. Recording log: a normal session keeps audio, transcript and meta
+rm -rf "$LOG_ROOT"
+make_osascript "button returned:Normal, gave up:false"
+run_script || true
+sess=$(latest_session)
+if [[ -f "$sess/audio.wav" ]] && \
+   [[ "$(cat "$sess/transcript.txt" 2>/dev/null)" == "hello from whisper" ]] && \
+   [[ "$(jq -r .status "$sess/meta.json" 2>/dev/null)" == "ok" ]] && \
+   [[ "$(jq -r .style "$sess/meta.json" 2>/dev/null)" == "Normal" ]]; then
+    pass "recording log → audio + transcript + meta"
+else
+    fail "recording log → audio + transcript + meta (session: '$sess', meta: $(cat "$sess/meta.json" 2>/dev/null))"
+fi
+
+# 9. Cancel still keeps the audio, marked cancelled
+rm -rf "$LOG_ROOT"
+make_osascript "" "1"
+run_script || true
+sess=$(latest_session)
+if [[ -f "$sess/audio.wav" ]] && [[ "$(jq -r .status "$sess/meta.json" 2>/dev/null)" == "cancelled" ]]; then
+    pass "cancel → audio kept, status cancelled"
+else
+    fail "cancel → audio kept, status cancelled (session: '$sess')"
+fi
+
+# 10. --retry re-transcribes the latest recording with a padded lead-in
+rm -f "$CLIPBOARD" "$MOCK_DIR/sox.log"
+run_script --retry >/dev/null || true
+if [[ -f "$sess/retries/1.txt" ]] && [[ -f "$sess/retries/1.json" ]] && \
+   [[ "$(jq -r .max_context "$sess/retries/1.json")" == "0" ]] && \
+   grep -q "pad 0\.[0-9][0-9][0-9]" "$MOCK_DIR/sox.log" 2>/dev/null && \
+   [[ "$(cat "$CLIPBOARD" 2>/dev/null)" == "hello from whisper" ]] && \
+   [[ ! -e "$sess/retries/.1.wav" ]]; then
+    pass "--retry → retries/1.{txt,json}, clipboard, temp wav cleaned"
+else
+    fail "--retry → retries/1.{txt,json}, clipboard (sox: $(cat "$MOCK_DIR/sox.log" 2>/dev/null))"
+fi
+
+# 11. A second --retry numbers itself 2 and raises the temperature
+run_script --retry >/dev/null || true
+if [[ "$(jq -r .temperature "$sess/retries/2.json" 2>/dev/null)" == "0.1" ]]; then
+    pass "--retry twice → retries/2 at temperature 0.1"
+else
+    fail "--retry twice → retries/2 at temperature 0.1"
+fi
+
+# 12. --last re-copies the latest transcript
+rm -rf "$LOG_ROOT"
+make_osascript "button returned:Normal, gave up:false"
+run_script || true
+rm -f "$CLIPBOARD"
+run_script --last >/dev/null || true
+if [[ "$(cat "$CLIPBOARD" 2>/dev/null)" == "hello from whisper" ]]; then
+    pass "--last → clipboard"
+else
+    fail "--last → clipboard"
+fi
+
+# 13. --retry with no recordings fails cleanly, with a notification
+rm -rf "$LOG_ROOT"
+make_osascript
+rm -f "$MOCK_DIR/notify.log"
+if ! run_script --retry >/dev/null && grep -q "No recording" "$MOCK_DIR/notify.log" 2>/dev/null; then
+    pass "--retry with no recordings → non-zero exit"
+else
+    fail "--retry with no recordings → non-zero exit"
 fi
 
 # ── summary ───────────────────────────────────────────────────────────────────

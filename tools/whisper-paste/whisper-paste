@@ -3,7 +3,8 @@
 # Assign to a global hotkey via macOS Shortcuts or Automator.
 
 set -eo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Appended (not prepended) so callers, e.g. the test suite, can shadow tools.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 
 # --- config -------------------------------------------------------------------
 
@@ -11,6 +12,8 @@ WHISPER_CLI="${WHISPER_CLI:-${WHISPER_DIR}/build/bin/whisper-cli}"
 MODEL="${WHISPER_MODEL:-${WHISPER_DIR}/models/ggml-large-v3-turbo.bin}"
 CONFIG_FILE="${HOME}/.config/whisper-dictate/config"
 STYLES_DIR="${WHISPER_STYLE_DIR:-${HOME}/.config/whisper-dictate/styles}"
+LOG_ROOT="${WHISPER_LOG_DIR:-${HOME}/.local/share/blather/recordings}"
+VAD_MODEL="${WHISPER_VAD_MODEL:-${WHISPER_DIR}/models/ggml-silero-v6.2.0.bin}"
 
 if [[ -z "${WHISPER_DIR:-}" ]]; then
     osascript -e 'display alert "whisper-paste: WHISPER_DIR not set" message "Export WHISPER_DIR=/path/to/whisper.cpp in your shell config." as critical' 2>/dev/null || true
@@ -61,33 +64,139 @@ show_settings() {
     while true; do
         timeout_min=$(( WHISPER_TIMEOUT / 60 ))
         choice=$(osascript 2>/dev/null <<EOF || break
-choose from list {"Change Timeout ($timeout_min min)", "Change Default Style ($WHISPER_DEFAULT_STYLE)", "Edit Casual Prompt"} with title "Whisper Settings" with prompt "Select a setting:" OK button name "Select" cancel button name "Done"
+choose from list {"Change Timeout ($timeout_min min)", "Change Default Style ($WHISPER_DEFAULT_STYLE)", "Edit Casual Prompt", "Retry Last Recording", "Open Recordings Folder"} with title "Whisper Settings" with prompt "Select a setting:" OK button name "Select" cancel button name "Done"
 EOF
         )
         case "$choice" in
             Change\ Timeout*)         change_timeout ;;
             Change\ Default\ Style*)  change_default_style ;;
             "Edit Casual Prompt")     edit_casual_prompt ;;
+            "Retry Last Recording")   retry_recording; break ;;
+            "Open Recordings Folder") mkdir -p "$LOG_ROOT"; open "$LOG_ROOT" ;;
             *)                        break ;;
         esac
     done
 }
 
-# --- settings shortcut --------------------------------------------------------
 
-[[ "${1:-}" == "--settings" ]] && { show_settings; exit 0; }
+# --- recording log ------------------------------------------------------------
+# Every session keeps its audio so a bad transcription (or a mis-click on
+# Cancel) never costs a re-take. Layout per session:
+#   <LOG_ROOT>/<timestamp>/audio.wav        raw 16kHz mono recording
+#   <LOG_ROOT>/<timestamp>/transcript.txt   text that was pasted
+#   <LOG_ROOT>/<timestamp>/whisper.json     whisper-cli full JSON (token probs)
+#   <LOG_ROOT>/<timestamp>/meta.json        style, status, timings, params
+#   <LOG_ROOT>/<timestamp>/retries/N.txt    re-transcriptions (+ N.json params,
+#                                           N.whisper.json full output)
+
+latest_session() {
+    local d
+    d=$(ls -1d "$LOG_ROOT"/*/ 2>/dev/null | sort | tail -1) || true
+    echo "${d%/}"
+}
+
+audio_duration() {
+    soxi -D "$1" 2>/dev/null || echo 0
+}
+
+notify() {
+    osascript -e "display notification \"$1\" with title \"Whisper Dictate\"" 2>/dev/null || true
+}
+
+transcribe() {
+    # transcribe <wav> <out-prefix-or-empty> [extra whisper-cli args...]
+    local wav="$1" out="$2"; shift 2
+    local json_args=()
+    [[ -n "$out" ]] && json_args=(-ojf -of "$out")
+    "$WHISPER_CLI" -m "$MODEL" -f "$wav" -np -nt -l en \
+        ${json_args[@]+"${json_args[@]}"} "$@" 2>/dev/null \
+    | sed 's/^[[:space:]]*//' | tr -d '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Re-run the latest (or a given) recording with jittered decode params:
+# a random lead-in of silence shifts every 30s window boundary, VAD splits on
+# pauses, and prior-text conditioning is off (the main repetition-loop trigger).
+# Later retries also raise the base temperature so each one decodes differently.
+retry_recording() {
+    local dir="${1:-$(latest_session)}"
+    if [[ ! -f "$dir/audio.wav" ]]; then
+        notify "No recording to retry"
+        echo "whisper-paste: no recording found in ${dir:-$LOG_ROOT}" >&2
+        return 1
+    fi
+    mkdir -p "$dir/retries"
+    local n=1
+    while [[ -e "$dir/retries/$n.txt" ]]; do n=$(( n + 1 )); done
+
+    local pad_ms=$(( RANDOM % 400 + 50 ))
+    local temp
+    temp=$(awk -v n="$n" 'BEGIN { t = (n - 1) * 0.1; if (t > 0.5) t = 0.5; printf "%.1f", t }')
+    local padded="$dir/retries/.$n.wav"
+    sox "$dir/audio.wav" "$padded" pad "$(printf '0.%03d' "$pad_ms")"
+
+    local args=(-mc 0 -tp "$temp")
+    local vad=false
+    if [[ -f "$VAD_MODEL" ]]; then args+=(--vad -vm "$VAD_MODEL"); vad=true; fi
+
+    notify "Retrying transcription (attempt $n)…"
+    local t0 text
+    t0=$(date +%s)
+    text=$(transcribe "$padded" "$dir/retries/$n.whisper" "${args[@]}") || true
+    rm -f "$padded"
+
+    printf '%s\n' "$text" > "$dir/retries/$n.txt"
+    jq -n --argjson pad_ms "$pad_ms" --arg temperature "$temp" --argjson vad "$vad" \
+          --argjson max_context 0 --arg model "$MODEL" \
+          --argjson seconds "$(( $(date +%s) - t0 ))" \
+          '{pad_ms: $pad_ms, temperature: ($temperature|tonumber), vad: $vad,
+            max_context: $max_context, model: $model, transcribe_seconds: $seconds}' \
+          > "$dir/retries/$n.json"
+
+    if [[ -z "$text" ]]; then notify "Retry produced no text"; return 1; fi
+    printf '%s' "$text" | pbcopy
+    printf '%s\n' "$text"
+    notify "Retry $n copied to clipboard"
+    afplay /System/Library/Sounds/Pop.aiff &
+}
+
+# --- subcommands --------------------------------------------------------------
+
+case "${1:-}" in
+    --settings) show_settings; exit 0 ;;
+    --retry)    retry_recording "${2:-}"; exit $? ;;
+    --last)
+        last=$(latest_session)
+        [[ -f "$last/transcript.txt" ]] || { echo "whisper-paste: no transcript yet" >&2; exit 1; }
+        pbcopy < "$last/transcript.txt"; cat "$last/transcript.txt"; exit 0 ;;
+    --dir)      latest_session; exit 0 ;;
+esac
 
 # --- recording ----------------------------------------------------------------
 
-TMP=$(mktemp -t whisper)
-TMP_WAV="${TMP}.wav"
-trap 'rm -f "$TMP" "$TMP_WAV"' EXIT
+SESSION="$LOG_ROOT/$(date +%Y-%m-%d_%H%M%S)"
+mkdir -p "$SESSION"
+WAV="$SESSION/audio.wav"
+STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+STATUS=recording
+STYLE=""
+TRANSCRIBE_SECONDS=0
+
+write_meta() {
+    jq -n --arg started "$STARTED" --arg status "$STATUS" --arg style "$STYLE" \
+          --arg app "${PREV_APP:-}" --arg model "$MODEL" \
+          --argjson duration "$(audio_duration "$WAV")" \
+          --argjson transcribe_seconds "$TRANSCRIBE_SECONDS" \
+          '{started: $started, status: $status, style: $style, app: $app,
+            model: $model, duration_seconds: $duration,
+            transcribe_seconds: $transcribe_seconds}' \
+          > "$SESSION/meta.json" 2>/dev/null || true
+}
 
 PREV_APP=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || true)
 
 afplay /System/Library/Sounds/Tink.aiff &
 sleep 0.5
-rec -r 16000 -c 1 -b 16 -e signed-integer "$TMP_WAV" 2>/dev/null &
+rec -r 16000 -c 1 -b 16 -e signed-integer "$WAV" 2>/dev/null &
 REC_PID=$!
 
 RESULT=$(osascript -e "display dialog \"🎙  Recording — speak when ready, pause as long as you like.\" buttons {\"Cancel\", \"Normal\", \"casual\"} default button \"$WHISPER_DEFAULT_STYLE\" cancel button \"Cancel\" with title \"Whisper Dictate\" giving up after $WHISPER_TIMEOUT" 2>/dev/null || echo "button returned:Cancel")
@@ -98,12 +207,19 @@ if echo "$RESULT" | grep -q "gave up:true"; then GAVE_UP=true; fi
 kill "$REC_PID" 2>/dev/null
 wait "$REC_PID" 2>/dev/null || true
 
-[[ "$BUTTON" == "Cancel" ]] && exit 0
+if [[ "$BUTTON" == "Cancel" ]]; then
+    STATUS=cancelled; write_meta
+    exit 0
+fi
 
 if $GAVE_UP; then
     afplay /System/Library/Sounds/Basso.aiff &
     BUTTON="$WHISPER_DEFAULT_STYLE"
 fi
+
+STYLE="$BUTTON"
+STATUS=$($GAVE_UP && echo timed-out-transcribing || echo transcribing)
+write_meta
 
 # --- transcription ------------------------------------------------------------
 
@@ -112,13 +228,16 @@ if [[ "$BUTTON" == "casual" ]]; then
     PROMPT_ARG=(--prompt "$(cat "$STYLES_DIR/casual.txt")")
 fi
 
-TEXT=$(
-    "$WHISPER_CLI" -m "$MODEL" -f "$TMP_WAV" -np -nt -l en \
-        ${PROMPT_ARG[@]+"${PROMPT_ARG[@]}"} 2>/dev/null \
-    | sed 's/^[[:space:]]*//' | tr -d '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
-)
+T0=$(date +%s)
+TEXT=$(transcribe "$WAV" "$SESSION/whisper" ${PROMPT_ARG[@]+"${PROMPT_ARG[@]}"})
+TRANSCRIBE_SECONDS=$(( $(date +%s) - T0 ))
+printf '%s\n' "$TEXT" > "$SESSION/transcript.txt"
 
-[[ -z "$TEXT" ]] && exit 0
+if [[ -z "$TEXT" ]]; then
+    STATUS=empty; write_meta
+    exit 0
+fi
+STATUS=ok; write_meta
 
 echo -n "$TEXT" | pbcopy
 

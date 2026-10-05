@@ -48,7 +48,23 @@ you can also run it directly from a terminal:
 ```bash
 whisper-paste              # record
 whisper-paste --settings   # open settings menu
+whisper-paste --retry      # re-transcribe the last recording with jittered params
+whisper-paste --last       # copy the last transcript to the clipboard again
+whisper-paste --dir        # print the last recording's folder
 ```
+
+## recordings and retry
+
+every recording is kept, including cancelled ones, under `~/.local/share/blather/recordings/<timestamp>/`:
+
+- `audio.wav`: the raw 16kHz mono recording, written there live so a crash mid-recording doesn't lose it
+- `transcript.txt`: what got pasted
+- `whisper.json`: whisper-cli's full JSON output (segments, tokens, probabilities)
+- `meta.json`: style, status (`ok`, `cancelled`, `empty`, or `transcribing` if whisper died), frontmost app, duration, timings
+
+if a transcription comes back garbled (repetition loops, dropped sentences), run `whisper-paste --retry` or pick **Retry Last Recording** in settings. each retry shifts the 30s decode windows with a random 50-450ms lead-in of silence, turns on VAD, drops prior-text conditioning (the main repetition-loop trigger), and nudges the base temperature up 0.1 per attempt. results land in `retries/N.txt` with their params in `retries/N.json` and are copied to the clipboard.
+
+nothing is deleted automatically; audio costs about 2MB per minute.
 
 ## settings
 
@@ -57,6 +73,8 @@ press `⌥⌘,` (or run `whisper-paste --settings`) to open a menu with:
 - **Change Timeout** — how long the recording dialog waits before auto-transcribing (default 30 min)
 - **Change Default Style** — Normal or casual (controls which button is selected when you press Return)
 - **Edit Casual Prompt** — opens `casual.txt` in your default text editor
+- **Retry Last Recording** — see [recordings and retry](#recordings-and-retry)
+- **Open Recordings Folder** — opens `~/.local/share/blather/recordings` in Finder
 
 settings are stored in `~/.config/whisper-dictate/config` as `KEY=VALUE` pairs.
 
@@ -80,6 +98,8 @@ settings live in `~/.config/whisper-dictate/config` (managed via the settings me
 | `WHISPER_STYLE_DIR` | `~/.config/whisper-dictate/styles` | directory containing style prompt files |
 | `WHISPER_TIMEOUT` | `1800` (30 min) | recording dialog timeout in seconds |
 | `WHISPER_DEFAULT_STYLE` | `Normal` | default button (`Normal` or `casual`) |
+| `WHISPER_LOG_DIR` | `~/.local/share/blather/recordings` | where recordings are kept |
+| `WHISPER_VAD_MODEL` | `$WHISPER_DIR/models/ggml-silero-v6.2.0.bin` | VAD model used by `--retry` (skipped if missing; fetch with `models/download-vad-model.sh silero-v6.2.0`) |
 
 ## development
 
@@ -90,7 +110,7 @@ if you're hacking on the script:
 ./tools/whisper-paste/deploy               # test, then copy to ~/.local/bin
 ```
 
-the test suite mocks `osascript`, `rec`, `whisper-cli`, `pbcopy`, etc. so it runs anywhere without a mic or whisper install. five tests cover the main flows (normal, casual, cancel, timeout, syntax).
+the test suite mocks `osascript`, `rec`, `sox`, `whisper-cli`, `pbcopy`, etc. so it runs anywhere without a mic or whisper install. it covers the main flows (normal, casual, cancel, timeout), the recording log, and `--retry` / `--last`.
 
 ## model
 
